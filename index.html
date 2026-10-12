@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Нейрон с видеокамерой</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #f4f4f6; color: #222; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.hint { margin: 0 0 14px; color: #555; font-size: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+  .card { background: #fff; border-radius: 10px; padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  video { width: 320px; max-width: 100%; border-radius: 8px; background: #000; transform: scaleX(-1); display: block; }
+  canvas.pix { width: 160px; height: 120px; image-rendering: pixelated; border-radius: 4px; background: #000; display: block; }
+  button { font-size: 15px; padding: 10px 14px; border: 0; border-radius: 8px; background: #3b6fe0; color: #fff; cursor: pointer; margin: 4px 4px 4px 0; touch-action: none; user-select: none; }
+  button.a { background: #2a7de1; }
+  button.b { background: #d9534f; }
+  button.gray { background: #777; }
+  button:disabled { background: #bbb; cursor: default; }
+  input.name { font-size: 15px; padding: 6px; width: 120px; }
+  .bar { height: 28px; border-radius: 6px; background: #2a7de1; position: relative; overflow: hidden; margin-top: 6px; }
+  .bar .fill { position: absolute; right: 0; top: 0; bottom: 0; background: #d9534f; width: 50%; }
+  .bar span { position: absolute; top: 4px; font-size: 14px; color: #fff; font-weight: 600; }
+  #log { font-size: 13px; color: #444; min-height: 36px; white-space: pre-line; }
+  h3 { margin: 0 0 6px; font-size: 15px; }
+  small { color: #666; }
+</style>
+</head>
+<body>
+
+<h1>Один нейрон + видеокамера</h1>
+<p class="hint">
+  Нейрон учится прямо в браузере: ты показываешь камере два разных объекта (или две позы),
+  нейрон смотрит на 192 пикселя и сам решает, какие из них важны.
+  Всё написано руками, без библиотек.
+</p>
+
+<div class="row">
+
+  <div class="card">
+    <h3>1. Камера</h3>
+    <video id="video" autoplay playsinline muted></video>
+    <button id="btnCam" class="gray">Включить камеру</button>
+    <div id="camError" style="color:#c00; font-size:13px;"></div>
+  </div>
+
+  <div class="card">
+    <h3>2. Что видит нейрон</h3>
+    <canvas id="seen" class="pix" width="16" height="12"></canvas>
+    <small>Это кадр, уменьшенный до 16×12 пикселей и сделанный чёрно-белым.<br>
+    Именно эти 192 числа попадают на вход нейрона.</small>
+  </div>
+
+  <div class="card">
+    <h3>3. Собери примеры</h3>
+    <div>
+      <input id="nameA" class="name" value="Объект А">
+      <button id="btnA" class="a" disabled>Держать: снимать А</button>
+      <span id="cntA">0</span>
+    </div>
+    <div>
+      <input id="nameB" class="name" value="Объект Б">
+      <button id="btnB" class="b" disabled>Держать: снимать Б</button>
+      <span id="cntB">0</span>
+    </div>
+    <small>Зажми кнопку и держи — пока держишь, снимается по 10 кадров в секунду.<br>
+    Двигай объект, меняй угол и расстояние. Нужно хотя бы по 30–50 кадров каждого.</small>
+    <div style="margin-top:8px;">
+      <button id="btnTrain" disabled>Обучить нейрон</button>
+      <button id="btnReset" class="gray">Сбросить всё</button>
+    </div>
+    <div id="log"></div>
+  </div>
+
+  <div class="card">
+    <h3>4. Предсказание</h3>
+    <div class="bar"><div class="fill" id="fill"></div>
+      <span id="labA" style="left:8px;">А</span>
+      <span id="labB" style="right:8px;">Б</span>
+    </div>
+    <div id="predText" style="margin-top:6px; font-size:15px;">Сначала обучи нейрон</div>
+    <h3 style="margin-top:14px;">Веса нейрона</h3>
+    <canvas id="wmap" class="pix" width="16" height="12"></canvas>
+    <small><span style="color:#d9534f">Красный</span> — если пиксель ярче среднего, это скорее Б.<br>
+    <span style="color:#2a7de1">Синий</span> — скорее А. Тёмный — пиксель не важен.</small>
+  </div>
+
+</div>
+
+<script>
+/* =====================================================================
+   ЯДРО: сам нейрон. Никаких библиотек — только арифметика.
+   (Эти же функции были в Python-версии, здесь они на JavaScript.)
+   ===================================================================== */
+/* CORE START */
+
+const W = 16;            // ширина уменьшенной картинки
+const H = 12;            // высота
+const N = W * H;         // число входов нейрона = число пикселей = 192
+
+// Сигмоида: сжимает любое число в диапазон (0, 1).
+function sigmoid(z) {
+  if (z > 30) z = 30;    // защита от переполнения exp
+  if (z < -30) z = -30;
+  return 1 / (1 + Math.exp(-z));
+}
+
+// Нормировка кадра. Из яркостей пикселей вычитаем среднюю яркость кадра
+// и делим на разброс. Так нейрон меньше зависит от того, светло в комнате
+// или темно: его интересует РИСУНОК, а не общая яркость.
+function normalize(gray) {
+  let mean = 0;
+  for (let i = 0; i < gray.length; i++) mean += gray[i];
+  mean /= gray.length;
+
+  let variance = 0;
+  for (let i = 0; i < gray.length; i++) {
+    const d = gray[i] - mean;
+    variance += d * d;
+  }
+  const std = Math.sqrt(variance / gray.length) + 1e-6; // 1e-6: чтобы не делить на 0
+
+  const x = new Float32Array(gray.length);
+  for (let i = 0; i < gray.length; i++) x[i] = (gray[i] - mean) / std;
+  return x;
+}
+
+// Создаёт нейрон: маленькие случайные веса и нулевое смещение.
+function newModel() {
+  const weights = new Float32Array(N);
+  for (let i = 0; i < N; i++) weights[i] = (Math.random() - 0.5) * 0.02;
+  return { weights: weights, bias: 0 };
+}
+
+// Прямой проход: z = w1*x1 + ... + w192*x192 + b, потом сигмоида.
+// Возвращает p = «уверенность, что это класс Б» (число от 0 до 1).
+function predict(model, x) {
+  let z = model.bias;
+  for (let i = 0; i < N; i++) z += model.weights[i] * x[i];
+  return sigmoid(z);
+}
+
+// Одна эпоха = один проход по всем примерам.
+// samples — массив {x: Float32Array(192), y: 0 или 1}.
+function trainEpoch(model, samples, lr) {
+  // Перемешиваем порядок (алгоритм Фишера–Йетса), чтобы порядок не влиял.
+  const order = [];
+  for (let i = 0; i < samples.length; i++) order.push(i);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+  }
+
+  for (let k = 0; k < order.length; k++) {
+    const s = samples[order[k]];
+    const p = predict(model, s.x);   // 1. что нейрон думает
+    const d = p - s.y;               // 2. на сколько ошибся
+    for (let i = 0; i < N; i++) {    // 3. сдвигаем каждый вес: w -= lr * d * x
+      model.weights[i] -= lr * d * s.x[i];
+    }
+    model.bias -= lr * d;            //    и смещение
+  }
+}
+
+// Средняя ошибка (перекрёстная энтропия) и доля правильных ответов.
+function evaluate(model, samples) {
+  let loss = 0, correct = 0;
+  for (let k = 0; k < samples.length; k++) {
+    const s = samples[k];
+    const p = predict(model, s.x);
+    loss += -(s.y * Math.log(p + 1e-12) + (1 - s.y) * Math.log(1 - p + 1e-12));
+    if ((p >= 0.5 ? 1 : 0) === s.y) correct++;
+  }
+  return { loss: loss / samples.length, acc: correct / samples.length };
+}
+
+/* CORE END */
+
+
+/* =====================================================================
+   ОБВЯЗКА: камера, кнопки, рисование. К самому обучению не относится.
+   ===================================================================== */
+
+const video = document.getElementById('video');
+const seen = document.getElementById('seen');
+const seenCtx = seen.getContext('2d');
+const wmap = document.getElementById('wmap');
+const wmapCtx = wmap.getContext('2d');
+
+// Скрытый холст 16x12: сюда браузер сам уменьшит кадр видео.
+const small = document.createElement('canvas');
+small.width = W;
+small.height = H;
+const smallCtx = small.getContext('2d', { willReadFrequently: true });
+
+let samples = [];          // все собранные примеры
+let counts = [0, 0];       // сколько кадров каждого класса
+let model = newModel();
+let trained = false;
+let training = false;
+let camOn = false;
+
+const el = id => document.getElementById(id);
+
+// Берёт текущий кадр камеры и возвращает массив из 192 яркостей (0..1).
+function grabGray() {
+  smallCtx.drawImage(video, 0, 0, W, H);          // уменьшение до 16x12
+  const data = smallCtx.getImageData(0, 0, W, H).data; // RGBA для каждого пикселя
+  const gray = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
+    gray[i] = (0.299 * r + 0.587 * g + 0.114 * b) / 255; // чёрно-белая яркость
+  }
+  return gray;
+}
+
+// Рисует 192 яркости на холсте 16x12 (потом CSS увеличивает его без сглаживания).
+function drawGray(ctx, gray) {
+  const img = ctx.createImageData(W, H);
+  for (let i = 0; i < N; i++) {
+    const v = Math.max(0, Math.min(255, Math.round(gray[i] * 255)));
+    img.data[i * 4] = v; img.data[i * 4 + 1] = v; img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+// Рисует веса: красный = положительный (Б), синий = отрицательный (А).
+function drawWeights() {
+  let maxAbs = 1e-6;
+  for (let i = 0; i < N; i++) maxAbs = Math.max(maxAbs, Math.abs(model.weights[i]));
+  const img = wmapCtx.createImageData(W, H);
+  for (let i = 0; i < N; i++) {
+    const t = Math.min(1, Math.abs(model.weights[i]) / maxAbs); // 0..1 — насколько вес велик
+    const v = Math.round(255 * t);
+    if (model.weights[i] >= 0) { img.data[i * 4] = v; img.data[i * 4 + 1] = 0; img.data[i * 4 + 2] = 0; }
+    else { img.data[i * 4] = 0; img.data[i * 4 + 1] = Math.round(v * 0.5); img.data[i * 4 + 2] = v; }
+    img.data[i * 4 + 3] = 255;
+  }
+  wmapCtx.putImageData(img, 0, 0);
+}
+
+function refreshButtons() {
+  el('cntA').textContent = counts[0];
+  el('cntB').textContent = counts[1];
+  el('btnA').disabled = !camOn || training;
+  el('btnB').disabled = !camOn || training;
+  el('btnTrain').disabled = !(counts[0] > 0 && counts[1] > 0) || training;
+  el('labA').textContent = el('nameA').value;
+  el('labB').textContent = el('nameB').value;
+}
+
+// ----- Камера -----
+el('btnCam').addEventListener('click', async () => {
+  el('camError').textContent = '';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    camOn = true;
+    el('btnCam').disabled = true;
+    refreshButtons();
+  } catch (e) {
+    el('camError').textContent = 'Не удалось включить камеру: ' + e.message +
+      '. Страницу нужно открывать с компьютера или по https (например, GitHub Pages), и разрешить доступ к камере.';
+  }
+});
+
+// ----- Сбор примеров: пока кнопка зажата, снимаем по кадру каждые 100 мс -----
+function holdToRecord(btnId, label) {
+  const btn = el(btnId);
+  let timer = null;
+  const capture = () => {
+    if (!camOn || video.readyState < 2) return;
+    const gray = grabGray();
+    samples.push({ x: normalize(gray), y: label });
+    counts[label]++;
+    refreshButtons();
+  };
+  const start = e => { e.preventDefault(); if (timer === null) { capture(); timer = setInterval(capture, 100); } };
+  const stop = () => { if (timer !== null) { clearInterval(timer); timer = null; } };
+  btn.addEventListener('pointerdown', start);
+  btn.addEventListener('pointerup', stop);
+  btn.addEventListener('pointerleave', stop);
+  btn.addEventListener('pointercancel', stop);
+}
+holdToRecord('btnA', 0);   // класс А — метка 0
+holdToRecord('btnB', 1);   // класс Б — метка 1
+
+el('nameA').addEventListener('input', refreshButtons);
+el('nameB').addEventListener('input', refreshButtons);
+
+// ----- Обучение: по 3 эпохи за «тик», чтобы страница не зависала -----
+el('btnTrain').addEventListener('click', () => {
+  model = newModel();
+  trained = false;
+  training = true;
+  refreshButtons();
+
+  const totalEpochs = 150;
+  const lr = 0.003;        // скорость обучения
+  let epoch = 0;
+
+  function tick() {
+    for (let k = 0; k < 3 && epoch < totalEpochs; k++) {
+      trainEpoch(model, samples, lr);
+      epoch++;
+    }
+    const r = evaluate(model, samples);
+    el('log').textContent = 'эпоха ' + epoch + ' из ' + totalEpochs +
+      '\nошибка ' + r.loss.toFixed(4) + ', точность на примерах ' + Math.round(r.acc * 100) + '%';
+    drawWeights();
+    if (epoch < totalEpochs) {
+      setTimeout(tick, 0);
+    } else {
+      training = false;
+      trained = true;
+      refreshButtons();
+    }
+  }
+  tick();
+});
+
+el('btnReset').addEventListener('click', () => {
+  samples = [];
+  counts = [0, 0];
+  model = newModel();
+  trained = false;
+  training = false;
+  el('log').textContent = '';
+  el('predText').textContent = 'Сначала обучи нейрон';
+  el('fill').style.width = '50%';
+  drawWeights();
+  refreshButtons();
+});
+
+// ----- Живое предсказание: около 10 раз в секунду -----
+setInterval(() => {
+  if (!camOn || video.readyState < 2) return;
+  const gray = grabGray();
+  drawGray(seenCtx, gray);                 // показываем, что видит нейрон
+  if (trained && !training) {
+    const p = predict(model, normalize(gray));   // вероятность класса Б
+    el('fill').style.width = (p * 100).toFixed(1) + '%';
+    const name = p >= 0.5 ? el('nameB').value : el('nameA').value;
+    const conf = p >= 0.5 ? p : 1 - p;
+    el('predText').textContent = name + ' — уверенность ' + Math.round(conf * 100) + '%';
+  }
+}, 100);
+
+drawWeights();
+refreshButtons();
+</script>
+</body>
+</html>
